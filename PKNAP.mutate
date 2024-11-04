@@ -1,0 +1,112 @@
+#!/usr/bin/env python
+
+version = '2.5.release'
+update  = '2023-12-29'
+
+#------------------------------------------------------------------------------
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--mdfnprefix', default='finetune_state_dict', type=str, metavar='finetune_state_dict',
+                    help='model state dict filename\n(pretrain_state_dict_fold/*/pretrain_state_dict)')
+parser.add_argument('--prfn', default='model_parameters.pkl', type=str, metavar='model_parameters.pkl',
+                    help='model parameter filename')
+parser.add_argument('--mutseq', default=None, type=str, metavar='None',
+                    help='sequence in mutate mode')
+parser.add_argument('--mutnu', default=1, type=int, metavar='1',
+                    help='number of positions to be mutated in mutate mode')
+parser.add_argument('--nsample', default=100, type=int, metavar='100',
+                    help='number of inference models')
+parser.add_argument('--bsize', default=2400, type=int, metavar='2400',
+                    help='batch size in model')
+parser.add_argument('--device', default='cuda', type=str, metavar='cuda',
+                    help='processor device (enumerable) cpu cuda')
+parser.add_argument('--gpuid', default='0', type=str, metavar='0',
+                    help='GPU ID (enumerable) 0 1 ...')
+parser.add_argument('--developer', action='store_true',
+                    help='developer mode')
+args = parser.parse_args()
+
+
+# import
+import os,sys,pickle,time
+import numpy as np
+import pandas as pd
+np.set_printoptions(precision=3, suppress=True)
+import warnings
+warnings.filterwarnings('ignore')
+import mkl
+mkl.set_num_threads(1)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.data as tdata
+device = args.device
+print('Using %s device' %device)
+if device == 'cuda' :
+  os.environ['CUDA_VISIBLE_DEVICES'] = args.gpuid
+  print ('Using GPU ID %s' %args.gpuid)
+
+from PKNAP_lib import *
+rlist = list('ACDEFGHIKLMNPQRSTVWY')
+
+
+# mutate
+print ('Mutate mode')
+
+# generate mutate data
+mut, mutlabel = Mutate(args.mutseq, args.mutnu)
+
+# load model
+para = pickle.load(open(args.prfn, 'rb'))
+print ('Load model parameter file %s' %args.prfn)
+wildcard = '%s*.pkl' %(args.mdfnprefix)
+print (' Inference model candidates wildcard', wildcard)
+from glob import glob
+psdlist = glob(wildcard)
+if len(psdlist)==0:
+  wildcard = 'pretrain_state_dict_fold/*/pretrain_state_dict*.pkl'
+  psdlist = glob(wildcard)
+K = min(args.nsample, len(psdlist))
+psds = np.random.choice(psdlist, K, replace=False)
+print (' Random choose %d inference models' %K)
+print (psds)
+
+ddgs = []
+for i in range(K):
+  # load inference model
+  mdfn = psds[i]
+  model = MyModule(device=device, **para)
+  old_state = torch.load(mdfn)
+  new_state = model.state_dict()
+  new_state.update(old_state)
+  model.load_state_dict(new_state)
+  model.to(device)
+  print ('Load model state dict file %s' %mdfn)
+
+  # predict
+  model.eval()
+  oindex = mut.index(args.mutseq)
+  data_pred = Embedding_CLS(mut)
+  X_pred = torch.tensor(data_pred, dtype=torch.long).to(device)
+  dataloader = tdata.DataLoader(X_pred, batch_size=args.bsize)
+  
+  y_pred = torch.concat([model.DGLayer(Xi)  for Xi in dataloader], axis=0).detach().cpu().numpy()
+  dy_pred = y_pred[oindex] - y_pred
+  ddgs.append(dy_pred)
+
+ddgs = np.array(ddgs)
+print (ddgs.shape)
+ddg_pred = ddgs.mean(0)
+ddgse_pred = ddgs.std(0)
+
+# report
+df = pd.DataFrame(data={'target':mut, 'ddg':ddg_pred, 'ddgse':ddgse_pred, 'label':mutlabel})
+df.drop_duplicates('target', inplace=True)
+df.sort_values('ddg', inplace=True)
+df.to_csv('%s.mutate.%d.csv'%(args.mutseq, args.mutnu), float_format='%.2f', index=False)
+
+if args.mutnu == 1 and args.developer :
+  np.save('%s.mutate.%d.npy'%(args.mutseq, args.mutnu), ddg_pred.reshape(9,20))
+  MutatePlot(ddg_pred.reshape(9,20), '%s.mutate.%d.png'%(args.mutseq, args.mutnu))
+

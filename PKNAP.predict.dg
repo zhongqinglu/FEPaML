@@ -1,0 +1,105 @@
+#!/usr/bin/env python
+
+version = '2.5.release'
+update  = '2023-12-29'
+
+#------------------------------------------------------------------------------
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--ipfn', default='dg.csv', type=str, metavar='dg.csv',
+                    help='input filename')
+parser.add_argument('--mdfnprefix', default='finetune_state_dict', type=str, metavar='finetune_state_dict',
+                    help='prefix of model state dict filenames (Default: "finetune_state_dict" for fine-tuned models; "pretrain_state_dict_fold/*/pretrain_state_dict" for pre-tained models)')
+parser.add_argument('--prfn', default='model_parameters.pkl', type=str, metavar='model_parameters.pkl',
+                    help='model parameter filename')
+parser.add_argument('--nsample', default=100, type=int, metavar='100',
+                    help='number of inference models')
+parser.add_argument('--bsize', default=2400, type=int, metavar='2400',
+                    help='batch size in model')
+parser.add_argument('--device', default='cuda', type=str, metavar='cuda',
+                    help='processor device (enumerable) cpu cuda')
+parser.add_argument('--gpuid', default='0', type=str, metavar='0',
+                    help='GPU ID (enumerable) 0 1 ...')
+args = parser.parse_args()
+
+
+# import
+import os,sys,pickle,time
+import numpy as np
+import pandas as pd
+np.set_printoptions(precision=3, suppress=True)
+import warnings
+warnings.filterwarnings('ignore')
+import mkl
+mkl.set_num_threads(1)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.data as tdata
+device = args.device
+print('Using %s device' %device)
+if device == 'cuda' :
+  os.environ['CUDA_VISIBLE_DEVICES'] = args.gpuid
+  print ('Using GPU ID %s' %args.gpuid)
+
+from PKNAP_lib import *
+rlist = list('ACDEFGHIKLMNPQRSTVWY')
+
+
+# predict
+print ('Predict mode')
+
+# load
+df = pd.read_csv(args.ipfn)
+print (df.shape[0])
+if df.shape[0]==0 : exit()
+seq_pred = df['Sequence'].tolist()
+data_pred = Embedding_CLS(seq_pred)
+X_pred = torch.tensor(data_pred, dtype=torch.long).to(device)
+
+# load model
+para = pickle.load(open(args.prfn, 'rb'))
+print ('Load model parameter file %s' %args.prfn)
+wildcard = '%s*.pkl' %(args.mdfnprefix)
+print (' Inference model candidates wildcard', wildcard)
+from glob import glob
+psdlist = glob(wildcard)
+if len(psdlist)==0:
+  wildcard = 'pretrain_state_dict_fold/*/pretrain_state_dict*.pkl'
+  psdlist = glob(wildcard)
+K = min(args.nsample, len(psdlist))
+psds = np.random.choice(psdlist, K, replace=False)
+print (' Random choose %d inference models' %K)
+print (psds)
+
+#ddgs = []
+dgs = []
+for i in range(K):
+  # load inference model
+  mdfn = psds[i]
+  model = MyModule(device=device, **para)
+  old_state = torch.load(mdfn)
+  new_state = model.state_dict()
+  new_state.update(old_state)
+  model.load_state_dict(new_state)
+  model.to(device)
+  print ('Load model state dict file %s' %mdfn)
+
+  # predict
+  model.eval()
+  y_pred = model.DGLayer(X_pred)
+  dgs.append(y_pred.detach().cpu().numpy())
+
+dgs = np.array(dgs)
+print (dgs.shape)
+dg_pred = dgs.mean(0)
+dgse_pred = dgs.std(0)
+bind_pred = Sigmoid(dg_pred)
+
+df['pred_dg'] = -dg_pred
+df['pred_dgse'] = dgse_pred
+df['pred_bind'] = bind_pred
+print (df)
+df.to_csv(args.ipfn, float_format='%.4f', index=False)
+

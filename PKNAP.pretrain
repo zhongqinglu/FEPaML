@@ -1,0 +1,140 @@
+#!/usr/bin/env python
+
+version = '2.5.release'
+update  = '2023-12-29'
+
+#------------------------------------------------------------------------------
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--ipfn', default='train.tsv', type=str, metavar='train.tsv',
+                    help='input filename')
+parser.add_argument('--prfn', default=None, type=str, metavar='None',
+                    help='parameter filename')
+parser.add_argument('--dim', default=32, type=int, metavar='32',
+                    help='dimension of model')
+parser.add_argument('--nh', default=4, type=int, metavar='4',
+                    help='number of heads in attention layer')
+parser.add_argument('--natl', default=1, type=int, metavar='1',
+                    help='number of attention layers in encoder')
+parser.add_argument('--dropout', default=0.0, type=float, metavar='0.0',
+                    help='dropout value in model')
+parser.add_argument('--maxlen', default=10, type=int, metavar='10',
+                    help='maximum length for input sequence')
+parser.add_argument('--kfold', default=10, type=int, metavar='10',
+                    help='k-fold cross validation')
+parser.add_argument('--kmax', default=1, type=int, metavar='1',
+                    help='k-fold cross validation')
+parser.add_argument('--bsize', default=1024, type=int, metavar='1024',
+                    help='batch size in model')
+parser.add_argument('--nstep', default=2000, type=int, metavar='2000',
+                    help='maximum number of iterative steps')
+parser.add_argument('--lr', default=0.0001, type=float, metavar='0.0001',
+                    help='learning rate in model')
+parser.add_argument('--l2reg', default=0.01, type=float, metavar='0.01',
+                    help='L2 regularization in model')
+parser.add_argument('--device', default='cuda', type=str, metavar='cuda',
+                    help='processor device (enumerable) cpu cuda')
+parser.add_argument('--gpuid', default='0', type=str, metavar='0',
+                    help='GPU ID (enumerable) 0 1 ...')
+parser.add_argument('--developer', action='store_true',
+                    help='developer mode')
+args = parser.parse_args()
+
+
+# import
+import os,sys,pickle,time
+import numpy as np
+import pandas as pd
+np.set_printoptions(precision=3, suppress=True)
+import warnings
+warnings.filterwarnings('ignore')
+import mkl
+mkl.set_num_threads(1)
+from sklearn.model_selection import KFold
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.data as tdata
+device = args.device
+print('Using %s device' %device)
+if device == 'cuda' :
+  os.environ['CUDA_VISIBLE_DEVICES'] = args.gpuid
+  print ('Using GPU ID %s' %args.gpuid)
+
+from PKNAP_lib import *
+rlist = list('ACDEFGHIKLMNPQRSTVWY')
+
+
+# load data
+df = pd.read_csv(args.ipfn, sep='\t')
+data = Embedding_CLS(df['Sequence'].to_list())
+label = df['Label'].to_numpy()
+
+# dataset
+X = torch.tensor(data,  dtype=torch.long ).to(device)
+y = torch.tensor(label, dtype=torch.float).to(device)
+print ('Dataset')
+print (' Data ', X.shape)
+print (' Label', y.shape)
+
+# k-fold
+k = args.kfold
+kmax = args.kmax
+kf = list(KFold(k, shuffle=True).split(data))
+print ('%d-fold Cross-validation Training' %k)
+
+# pre-train
+print ('Pre-train mode')
+if args.developer: print ('Developer mode')
+result = []
+for ki in range(kmax):
+  # load k-fold pretrain data
+  t,v = kf[ki]
+  trainset = tdata.TensorDataset(X[t],y[t])
+  trainloader = tdata.DataLoader(trainset, batch_size=args.bsize, shuffle=True)
+  validset = tdata.TensorDataset(X[v],y[v])
+  validloader = tdata.DataLoader(validset, batch_size=args.bsize)
+
+  # model
+  if args.prfn is None:
+    model = MyModule(args.dim, args.maxlen, args.nh, args.natl, args.dropout, device=device).to(device)
+    model.SaveParameters()
+  else:
+    para = pickle.load(open(args.prfn, 'rb'))
+    print ('Load parameter file %s' %args.prfn)
+    model = MyModule(device=device, **para).to(device)
+  # parameters
+  optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2reg)
+
+  # train
+  ESbest = 0.0
+  EPbest = 0
+  for epoch in range(1,args.nstep+1):
+    model.train()
+    for X_train, y_train in trainloader:
+      optimizer.zero_grad()
+      y_pred = model.DGLayer(X_train)
+      loss = F.binary_cross_entropy_with_logits(y_pred, y_train)
+      loss.backward()
+      optimizer.step()
+
+    # validation
+    if epoch % 10 == 0:
+      # report
+      m_train = Metric(model, trainloader)
+      m_valid = Metric(model, validloader)
+      print (' Fold %d  Epoch %5d  %s %s' %(ki, epoch, m_train, m_valid), flush=True)
+      # early stopping
+      if m_valid[2] > ESbest:
+        ESbest = m_valid[2]
+        EPbest = epoch
+      if epoch - EPbest > 500 : break
+
+  # save pretrain models
+  torch.save(model.state_dict(), 'pretrain_state_dict.%d.pkl' %ki)
+  result.append([m_train, m_valid])
+
+# summary
+for x in result: print (x)
+

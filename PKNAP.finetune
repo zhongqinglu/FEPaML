@@ -1,0 +1,187 @@
+#!/usr/bin/env python
+
+version = '2.5.release'
+update  = '2023-12-29'
+
+#------------------------------------------------------------------------------
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--ptfn', default='train.tsv', type=str, metavar='train.tsv',
+                    help='pre-train dataset filename')
+parser.add_argument('--ftfn', default='ddg.csv', type=str, metavar='ddg.csv',
+                    help='fine-tune dataset filename')
+parser.add_argument('--mdfold', default='pretrain_state_dict_fold', type=str, metavar='pretrain_state_dict_fold',
+                    help='model state dict fold')
+parser.add_argument('--mdfnprefix', default='pretrain_state_dict', type=str, metavar='pretrain_state_dict',
+                    help='prefix of model state dict filename')
+parser.add_argument('--prfn', default='model_parameters.pkl', type=str, metavar='model_parameters.pkl',
+                    help='parameter filename')
+parser.add_argument('--nsample', default=10, type=int, metavar='10',
+                    help='number of finetune model')
+parser.add_argument('--stoploss', default=None, type=float, metavar='None',
+                    help='***')
+parser.add_argument('--bsize', default=1024, type=int, metavar='1024',
+                    help='batch size in model')
+parser.add_argument('--nstep', default=5000, type=int, metavar='5000',
+                    help='maximum number of iterative steps')
+parser.add_argument('--lr', default=0.0001, type=float, metavar='0.0001',
+                    help='learning rate in model')
+parser.add_argument('--l2reg', default=0.01, type=float, metavar='0.01',
+                    help='L2 regularization in model')
+parser.add_argument('--ubddg', default=10.0, type=float, metavar='10.0',
+                    help='upper bound of ddG for training, default is 10 kcal/mol')
+parser.add_argument('--lbddgse', default=0.01, type=float, metavar='0.01',
+                    help='lower bound of ddG standard error for training, default is 0.01 kcal/mol')
+parser.add_argument('--append', action='store_true',
+                    help='append model state dict file from the existed ones')
+parser.add_argument('--device', default='cuda', type=str, metavar='cuda',
+                    help='processor device (enumerable) cpu cuda')
+parser.add_argument('--gpuid', default='0', type=str, metavar='0',
+                    help='GPU ID (enumerable) 0 1 ...')
+parser.add_argument('--developer', action='store_true',
+                    help='developer mode')
+parser.add_argument('--weight', default=None, type=str, metavar='None',
+                    help='Option for developer. Alterative: None, sigmoid(DEPRECATED), fepstd')
+args = parser.parse_args()
+
+
+# import
+import os,sys,pickle,time
+import numpy as np
+import pandas as pd
+np.set_printoptions(precision=3, suppress=True)
+import warnings
+warnings.filterwarnings('ignore')
+import mkl
+mkl.set_num_threads(1)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.data as tdata
+device = args.device
+print('Using %s device' %device)
+if device == 'cuda' :
+  os.environ['CUDA_VISIBLE_DEVICES'] = args.gpuid
+  print ('Using GPU ID %s' %args.gpuid)
+
+from PKNAP_lib import *
+rlist = list('ACDEFGHIKLMNPQRSTVWY')
+
+
+# load data
+df = pd.read_csv(args.ptfn, sep='\t')
+data = Embedding_CLS(df['Sequence'].to_list())
+label = df['Label'].to_numpy()
+
+# dataset
+X = torch.tensor(data,  dtype=torch.long ).to(device)
+y = torch.tensor(label, dtype=torch.float).to(device)
+print ('Dataset')
+print (' Data ', X.shape)
+print (' Label', y.shape)
+
+dataset = tdata.TensorDataset(X,y)
+#dataloader = tdata.DataLoader(dataset, batch_size=args.bsize, shuffle=True)
+dataloader = tdata.DataLoader(dataset, batch_size=args.bsize, shuffle=True, drop_last=True)
+
+# fine-tune
+print ('Fine-tune mode')
+
+# load ddg finetune data
+df_ft = pd.read_csv(args.ftfn)
+print (df_ft.shape)
+seq_ft = np.unique(list(df_ft.original)+list(df_ft.target)).tolist()
+data_ft = Embedding_CLS(seq_ft)
+X_ft = torch.tensor(data_ft, dtype=torch.long).to(device)
+ddg_ft = torch.tensor(np.array(df_ft['ddg']), dtype=torch.float).to(device)
+ddg_ft[ddg_ft > args.ubddg] = args.ubddg
+if args.stoploss is None: args.stoploss = df_ft['ddgse'].median()
+ddgse_ft = torch.tensor(np.array(df_ft['ddgse']), dtype=torch.float).to(device)
+ddgse_ft[ddgse_ft < args.lbddgse] = args.lbddgse
+ddgse2_ft = ddgse_ft**2
+#ddgs_ft = torch.sigmoid(ddg_ft)
+otindex_ft = np.array([[seq_ft.index(df_ft.loc[i, 'original']), seq_ft.index(df_ft.loc[i, 'target'])]  for i in df_ft.index]).T
+print ('Dataset fine-tune')
+print (' Data ', X_ft.shape)
+print (' ddG  ', ddg_ft.shape)
+print (' stoploss', args.stoploss)
+
+if args.weight == 'sigmoid':
+  ft_weight = torch.sigmoid(-ddg_ft)
+if args.weight == 'fepstd':
+  ft_weight = torch.where(ddgse_ft>1, 1/ddgse_ft, 1)
+  
+# load model
+para = pickle.load(open(args.prfn, 'rb'))
+print ('Load model parameter  file %s' %args.prfn)
+#print (para)
+wildcard_pretrain = '%s/*/%s*.pkl' %(args.mdfold, args.mdfnprefix)
+print (' Pre-train model candidates wildcard', wildcard_pretrain)
+from glob import glob
+psdlist = glob(wildcard_pretrain)
+if len(psdlist)==0:
+  wildcard = 'pretrain_state_dict_fold/*/pretrain_state_dict*.pkl'
+  psdlist = glob(wildcard)
+K = min(args.nsample, len(psdlist))
+#print (psdlist)
+psds = np.random.choice(psdlist, K, replace=False)
+print (' Random choose %d pre-train models' %K)
+print (psds)
+
+for i in range(K):
+  opfn = 'finetune_state_dict.%d.pkl'%i
+  if args.append and os.path.exists(opfn): continue
+
+  # load pretrain model
+  mdfn = psds[i]
+  model = MyModule(device=device, **para)
+  old_state = torch.load(mdfn)
+  new_state = model.state_dict()
+  new_state.update(old_state)
+  model.load_state_dict(new_state)
+  model.to(device)
+  print ('Load model state dict file %s' %mdfn)
+  
+  # parameters
+  optimizer = torch.optim.Adam([
+              {'params': model.aa_emb.parameters(),    'lr':args.lr*0.01, 'weight_decay':args.l2reg},
+              {'params': model.texn.parameters(),      'lr':args.lr*0.01, 'weight_decay':args.l2reg},
+              {'params': model.linear_mm.parameters(), 'lr':args.lr*0.1},
+              {'params': model.linear_m6.parameters(), 'lr':args.lr},
+              ])
+  #model.ReportParameters()
+  
+  # finetune
+  ESbest = 0.0
+  EPbest = 0
+  scalemax = 0.0001
+  print ('%5s %8s %8s %8s %8s' %('Epoch','Loss','Loss_Pt','Loss_Ft','Scale'))
+  for epoch in range(1,args.nstep+1):
+    model.train()
+    for X_train, y_train in dataloader:
+      optimizer.zero_grad()
+    # loss_finetune
+      y_ft = model.DGLayer(X_ft)
+      ddg_pred = ddg_ml(y_ft, otindex_ft) 
+      if args.weight is None:
+        loss_ft = F.mse_loss(ddg_pred, ddg_ft)
+      else:
+        loss_ft = torch.mean(F.mse_loss(ddg_pred, ddg_ft, reduction='none') * ft_weight)
+    # loss_pretrain
+      y_pred = model.DGLayer(X_train)
+      loss_pt = F.binary_cross_entropy_with_logits(y_pred, y_train)
+    # loss_all
+      scale = min((loss_pt/loss_ft).item(),1)
+      #if scale > scalemax and epoch > 10 : scalemax = scale
+      if scale > scalemax : scalemax = scale
+      loss = loss_pt + loss_ft * scalemax
+      loss.backward()
+      optimizer.step()
+    print ('%5d %8.3f %8.3f %8.3f %8.3f' %(epoch, loss.item(), loss_pt.item(), loss_ft.item(), scalemax), flush=True)
+    if scalemax == 1 and loss_ft.item() < args.stoploss : break
+    #if scalemax == 1 and loss_ft.item() < args.stoploss**2 : break
+  
+  # save finetune model
+  torch.save(model.state_dict(), opfn)
+
